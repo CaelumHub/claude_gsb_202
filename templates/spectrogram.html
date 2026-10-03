@@ -19,7 +19,7 @@
   </div>
   <div class="plot"><canvas id="spec" style="height:300px"></canvas></div>
   <div class="row mt small muted">
-    <span>频率 0 – 20 kHz（向上）</span>
+    <span>频率（向上）</span>
     <span class="spacer"></span>
     <span>时间 →</span>
   </div>
@@ -45,6 +45,7 @@
 {% block scripts %}
 <script>
 let spectral = null;
+const plotPad = { l: 44, r: 12, t: 10, b: 24 };
 
 async function loadFiles(selected) {
   const files = await API.get("/api/library");
@@ -74,7 +75,13 @@ function drawFeatures() {
     legend.push(`<span><span class="dot" style="background:${color}"></span>${name} [${fmtVal(mn)} – ${fmtVal(mx)}]</span>`);
   }
   $("#featureLegend").innerHTML = legend.join("");
-  drawLinePlot($("#features"), series);
+  drawLinePlot($("#features"), series, {
+    pad: plotPad,
+    timeAxis: true,
+    xTimes: s.times,
+    xMin: 0,
+    xMax: s.duration ?? 0,
+  });
 }
 
 async function run() {
@@ -85,9 +92,14 @@ async function run() {
   try {
     const spec = (await API.get(`/api/analyze/${id}/spectrogram`)).data;
     spectral = (await API.get(`/api/analyze/${id}/spectral`)).data;
-    drawSpectrogram($("#spec"), spec);
+    const duration = spectral.duration ?? spec.duration ?? 0;
+    drawSpectrogram($("#spec"), spec, {
+      pad: plotPad,
+      xMin: 0,
+      xMax: duration,
+    });
     $("#specInfo").textContent =
-      `${spec.times.length} 时间帧 × ${spec.freqs.length} 频带 · nfft=${spec.nfft} · hop=${spec.hop}`;
+      `${spec.times.length} 声谱列 / ${spec.frame_count} 分析帧 × ${spec.freqs.length} 频带 · nfft=${spec.nfft} · hop=${spec.hop}`;
     drawFeatures();
   } catch (e) { toast(e.message, "error"); }
   finally { btn.disabled = false; btn.textContent = "分析"; }

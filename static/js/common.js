@@ -132,26 +132,75 @@ function drawSpectrogram(canvas, spec, opts = {}) {
   const { ctx, w, h } = setupCanvas(canvas);
   const data = spec.data || [];
   const rows = data.length;
+  const cols = data[0] ? data[0].length : 0;
   ctx.clearRect(0, 0, w, h);
-  if (!rows) return;
+  if (!rows || !cols) return;
 
-  const img = ctx.createImageData(w, h);
-  const cols = data[0].length;
-  // dB normalisation: assume floor -100, ceiling 0.
+  const pad = opts.pad || { l: 44, r: 12, t: 10, b: 24 };
+  const pw = w - pad.l - pad.r;
+  const ph = h - pad.t - pad.b;
   const dbMin = opts.dbMin ?? -100, dbMax = opts.dbMax ?? 0;
-  for (let y = 0; y < h; y++) {
-    const rowIdx = Math.floor((h - 1 - y) / h * rows);
-    const row = data[rowIdx];
-    for (let x = 0; x < w; x++) {
-      const colIdx = Math.floor(x / w * cols);
-      const v = row[colIdx];
-      const t = (v - dbMin) / (dbMax - dbMin);
-      const [r, g, b] = colormap(t);
-      const idx = (y * w + x) * 4;
-      img.data[idx] = r; img.data[idx + 1] = g; img.data[idx + 2] = b; img.data[idx + 3] = 255;
+  const xMin = opts.xMin ?? 0;
+  const xMax = opts.xMax ?? spec.duration ?? spec.frame_count ?? rows;
+  const times = spec.times || [];
+  const xRange = xMax - xMin;
+
+  const rowAt = (x) => {
+    if (!xRange || !times.length) return 0;
+    const t = xMin + (x / pw) * xRange;
+    let lo = 0, hi = times.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (times[mid] < t) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo > 0 && Math.abs(t - times[lo - 1]) <= Math.abs(times[lo] - t)) lo--;
+    return Math.max(0, Math.min(rows - 1, lo));
+  };
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad.l, pad.t, pw, ph);
+  ctx.clip();
+  const img = ctx.createImageData(pw, ph);
+  for (let x = 0; x < pw; x++) {
+    const row = xRange > 0 ? rowAt(x) : Math.min(rows - 1, Math.floor(x / pw * rows));
+    for (let y = 0; y < ph; y++) {
+      const colIdx = Math.floor((ph - 1 - y) / ph * cols);
+      const v = data[row][colIdx];
+      const value = (v - dbMin) / (dbMax - dbMin);
+      const [r, g, b] = colormap(value);
+      const idx = (y * pw + x) * 4;
+      img.data[idx] = r;
+      img.data[idx + 1] = g;
+      img.data[idx + 2] = b;
+      img.data[idx + 3] = 255;
     }
   }
-  ctx.putImageData(img, 0, 0);
+  ctx.putImageData(img, pad.l, pad.t);
+  ctx.restore();
+
+  ctx.strokeStyle = "rgba(139,148,158,0.35)";
+  ctx.fillStyle = "rgba(139,148,158,0.6)";
+  ctx.font = "10px sans-serif";
+  ctx.strokeRect(pad.l, pad.t, pw, ph);
+  for (let g = 0; g <= 4; g++) {
+    const x = pad.l + pw * (g / 4);
+    ctx.beginPath();
+    ctx.moveTo(x, pad.t);
+    ctx.lineTo(x, pad.t + ph);
+    ctx.strokeStyle = "rgba(139,148,158,0.12)";
+    ctx.stroke();
+    const t = xMin + xRange * (g / 4);
+    ctx.fillStyle = "rgba(139,148,158,0.6)";
+    ctx.fillText(fmtTime(t), x - 14, pad.t + ph + 15);
+  }
+  const freqs = spec.freqs || [];
+  const fMax = freqs.length ? freqs[freqs.length - 1] : 1;
+  for (let g = 0; g <= 4; g++) {
+    const y = pad.t + ph * (1 - g / 4);
+    ctx.fillText(fmtHz(fMax * g / 4), 4, y + 3);
+  }
 }
 
 /* -------------------------------------------------------------- line plot */
@@ -159,21 +208,25 @@ function drawSpectrogram(canvas, spec, opts = {}) {
 function drawLinePlot(canvas, seriesList, opts = {}) {
   const { ctx, w, h } = setupCanvas(canvas);
   ctx.clearRect(0, 0, w, h);
-  const pad = { l: 44, r: 12, t: 10, b: 20 };
+  const pad = opts.pad || { l: 44, r: 12, t: 10, b: 24 };
   const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
 
-  let yMin = Infinity, yMax = -Infinity, xMax = 0;
+  let yMin = Infinity, yMax = -Infinity;
+  let xMaxIndex = 0;
   for (const s of seriesList) {
-    for (let i = 0; i < s.data.length; i++) {
-      const v = s.data[i];
+    xMaxIndex = Math.max(xMaxIndex, s.data.length - 1);
+    for (const v of s.data) {
       if (v < yMin) yMin = v;
       if (v > yMax) yMax = v;
-      xMax = Math.max(xMax, s.data.length);
     }
   }
   if (!isFinite(yMin)) return;
   if (yMin === yMax) { yMin -= 1; yMax += 1; }
   const range = yMax - yMin;
+  const xTimes = opts.xTimes || null;
+  const xMin = opts.xMin ?? (xTimes ? xTimes[0] : 0);
+  const xMax = opts.xMax ?? (xTimes ? xTimes[xTimes.length - 1] : xMaxIndex);
+  const xRange = xMax - xMin;
 
   // grid
   ctx.strokeStyle = "rgba(139,148,158,0.15)";
@@ -184,9 +237,17 @@ function drawLinePlot(canvas, seriesList, opts = {}) {
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + pw, y); ctx.stroke();
     const val = yMax - range * (g / 4);
     ctx.fillText(fmtVal(val), 4, y + 3);
+
+    const x = pad.l + pw * (g / 4);
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + ph); ctx.stroke();
+    if (opts.timeAxis) ctx.fillText(fmtTime(xMin + xRange * (g / 4)), x - 14, pad.t + ph + 15);
   }
 
-  const xAt = (i) => pad.l + (xMax <= 1 ? 0 : i / (xMax - 1) * pw);
+  const xAt = (i) => {
+    if (!xRange) return pad.l;
+    const t = xTimes ? xTimes[Math.min(i, xTimes.length - 1)] : xMin + i;
+    return pad.l + ((t - xMin) / xRange) * pw;
+  };
   const yAt = (v) => pad.t + (1 - (v - yMin) / range) * ph;
 
   for (const s of seriesList) {

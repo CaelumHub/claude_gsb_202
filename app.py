@@ -41,6 +41,7 @@ if _CORS:
 
 store = storage.Storage(DATA_DIR)
 rt = realtime.new_analyzer()
+ANALYSIS_VERSION = 2
 
 
 # --------------------------------------------------------------------------- #
@@ -418,13 +419,14 @@ def api_analyze(file_id: str, kind: str):
     refresh = request.args.get("refresh") == "1"
     if not refresh:
         cached = store.get_analysis(file_id, kind)
-        if cached:
+        if cached and cached.get("params", {}).get("version") == ANALYSIS_VERSION:
             return jsonify(cached)
     try:
         data = _run_analysis(kind, _abs_path(entry))
     except ValueError as e:
         return jsonify(error=str(e)), 400
-    doc = store.save_analysis(file_id, kind, data, {"kind": kind})
+    doc = store.save_analysis(file_id, kind, data,
+                              {"kind": kind, "version": ANALYSIS_VERSION})
     return jsonify(doc)
 
 

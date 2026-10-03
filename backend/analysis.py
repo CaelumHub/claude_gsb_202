@@ -17,7 +17,6 @@ Analysers
 
 from __future__ import annotations
 
-import math
 from typing import Dict, Generator, List, Optional, Tuple
 
 from . import audio_io, dsp
@@ -27,44 +26,62 @@ from . import audio_io, dsp
 # Streaming generators
 # --------------------------------------------------------------------------- #
 
-def stream_stft(path: str, nfft: int = 2048, hop: int = 512,
-                win: str = "hann") -> Generator[Tuple[List[float], float], None, None]:
-    """Yield (magnitude-spectrum, sample-rate) frames, streamed from disk.
+def _stream_frames(path: str, frame_len: int = 2048, hop: int = 512,
+                   win: str = "hann", center: bool = True
+                   ) -> Generator[Tuple[List[float], List[float], List[float], float], None, None]:
+    """Yield ``(raw_frame, windowed_frame, magnitude_frame, sample_rate)``.
 
-    Only ``nfft//2+1`` positive bins are returned.  A carry buffer makes the
-    frames seamless across the fixed-size read chunks."""
-    w = dsp.window(win, nfft)
-    carry: List[float] = [0.0] * (nfft // 2)  # centre-pad once at the start
+    ``center=True`` uses the same edge padding as :func:`dsp.stft`.  Sharing one
+    frame grid for spectral and time-domain measurements is what keeps RMS/ZCR
+    aligned with centroid/rolloff/flux.  The final partial windows are drained
+    so every analysis contains the complete, deterministic set of frames.
+    """
+    w = dsp.window(win, frame_len)
+    carry: List[float] = [0.0] * (frame_len // 2 if center else 0)
+    bins = frame_len // 2 + 1
+    saw_audio = False
+
+    def emit() -> Generator[Tuple[List[float], List[float], List[float], float], None, None]:
+        while len(carry) >= frame_len:
+            frame = list(carry[:frame_len])
+            windowed = [frame[k] * w[k] for k in range(frame_len)]
+            spectrum = dsp.fft(windowed)
+            mag = [abs(spectrum[k]) for k in range(bins)]
+            yield frame, windowed, mag, sr
+            del carry[:hop]
+
     with audio_io.WavReader(path) as r:
         sr = r.sr
         while True:
             chunk = r.read_chunk(1 << 16)
             if chunk is None:
                 break
+            saw_audio = True
             carry.extend(audio_io.to_mono(chunk))
-            while len(carry) >= nfft:
-                seg = carry[:nfft]
-                frame = dsp.fft([seg[k] * w[k] for k in range(nfft)])
-                bins = nfft // 2 + 1
-                mag = [abs(frame[k]) for k in range(bins)]
-                yield mag, sr
-                carry = carry[hop:]
+            yield from emit()
+        if center and saw_audio:
+            carry.extend([0.0] * (frame_len // 2))
+            yield from emit()
+
+
+def stream_stft(path: str, nfft: int = 2048, hop: int = 512,
+                win: str = "hann", center: bool = True
+                ) -> Generator[Tuple[List[float], float], None, None]:
+    """Yield (magnitude-spectrum, sample-rate) frames, streamed from disk.
+
+    Only ``nfft//2+1`` positive bins are returned.  Centred framing and the
+    carried sample buffer make frames seamless across fixed-size read chunks.
+    """
+    for _frame, _windowed, mag, sr in _stream_frames(path, nfft, hop, win, center):
+        yield mag, sr
 
 
 def stream_windows(path: str, win_len: int = 2048,
-                   hop: int = 512) -> Generator[Tuple[List[float], float], None, None]:
-    """Yield (windowed time-domain frame, sample-rate) from disk."""
-    carry: List[float] = []
-    with audio_io.WavReader(path) as r:
-        sr = r.sr
-        while True:
-            chunk = r.read_chunk(1 << 16)
-            if chunk is None:
-                break
-            carry.extend(audio_io.to_mono(chunk))
-            while len(carry) >= win_len:
-                yield list(carry[:win_len]), sr
-                carry = carry[hop:]
+                   hop: int = 512, center: bool = True
+                   ) -> Generator[Tuple[List[float], float], None, None]:
+    """Yield (time-domain frame, sample-rate) from disk on the standard grid."""
+    for frame, _windowed, _mag, sr in _stream_frames(path, win_len, hop, "rectangular", center):
+        yield frame, sr
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +99,8 @@ def analyze_spectrogram(path: str, nfft: int = 2048, hop: int = 512,
     with audio_io.WavReader(path) as r:
         total_frames = r.nframes
         sr = r.sr
-    est_frames = max(1, total_frames // hop)
+    duration = total_frames / sr if sr else 0.0
+    est_frames = max(1, total_frames // hop + 1)
     bucket = max(1, est_frames // max_time)
     n_bins = nfft // 2 + 1
 
@@ -113,14 +131,22 @@ def analyze_spectrogram(path: str, nfft: int = 2048, hop: int = 512,
             _flush()
     _flush()
 
-    times = [i * bucket * hop / sr for i in range(len(rows))]
+    centers = [i * bucket * hop / sr for i in range(len(rows))]
+    edges = [0.0]
+    for i in range(1, len(rows)):
+        edge = (i * bucket - 0.5) * hop / sr
+        edges.append(max(0.0, min(duration, edge)))
+    edges.append(duration)
+
     freqs = [k * sr / nfft for k in range(max_freq)]
     # freqs represent band centres; recompute as the centre of each group
     group = max(1, n_bins // max_freq)
     freqs = [((b + group // 2) * sr / nfft) for b in range(0, n_bins, group)][:max_freq]
 
     return {
-        "times": times,
+        "times": centers,
+        "time_edges": edges,
+        "duration": duration,
         "freqs": freqs,
         "data": rows,
         "sr": sr,
@@ -136,39 +162,41 @@ def analyze_spectrogram(path: str, nfft: int = 2048, hop: int = 512,
 
 def analyze_spectral(path: str, nfft: int = 2048, hop: int = 512,
                      rolloff_pct: float = 0.85) -> Dict:
-    """Time series of spectral features (centroid, rolloff, flatness, flux, rms, zcr)."""
-    bins = nfft // 2 + 1
-    freqs = dsp.rfft_freqs(nfft, 44100)  # placeholder; recomputed per frame sr
-    sr = 44100
+    """Time series of spectral features (centroid, rolloff, flatness, flux, rms, zcr).
 
+    All series are calculated in one pass over the same centred STFT windows.
+    RMS uses the same Hann window as the spectrum; ZCR uses the corresponding
+    raw frame.  Every series therefore has one value at each common timestamp.
+    """
     centroids: List[float] = []
     rolloffs: List[float] = []
     flatness: List[float] = []
     flux: List[float] = []
-    prev = None
-    frame_idx = 0
-    hop_actual = hop
+    rms_series: List[float] = []
+    zcr_series: List[float] = []
 
-    for mag, sr in stream_stft(path, nfft, hop):
+    prev = None
+    frame_count = 0
+    sr = 44100
+    for frame, windowed, mag, frame_sr in _stream_frames(path, nfft, hop, "hann", True):
+        sr = frame_sr
         freqs = dsp.rfft_freqs(nfft, sr)
         centroids.append(dsp.spectral_centroid(mag, freqs))
         rolloffs.append(dsp.spectral_rolloff(mag, freqs, rolloff_pct))
         flatness.append(dsp.spectral_flatness(mag))
         flux.append(dsp.spectral_flux(mag, prev))
-        prev = mag
-        frame_idx += 1
-
-    # RMS + ZCR from the time-domain windows.
-    rms_series: List[float] = []
-    zcr_series: List[float] = []
-    for frame, _sr in stream_windows(path, nfft, hop):
-        sr = _sr
-        rms_series.append(dsp.rms(frame))
+        rms_series.append(dsp.rms(windowed))
         zcr_series.append(dsp.zero_crossing_rate(frame))
+        prev = mag
+        frame_count += 1
 
-    times = [i * hop / sr for i in range(frame_idx)]
+    with audio_io.WavReader(path) as r:
+        duration = r.nframes / r.sr if r.sr else 0.0
+    times = [i * hop / sr for i in range(frame_count)] if sr else []
     return {
         "sr": sr,
+        "duration": duration,
+        "hop_time": hop / sr if sr else 0.0,
         "times": times,
         "centroid": centroids,
         "rolloff": rolloffs,

@@ -133,60 +133,143 @@ function drawSpectrogram(canvas, spec, opts = {}) {
   const data = spec.data || [];
   const rows = data.length;
   ctx.clearRect(0, 0, w, h);
-  if (!rows) return;
+  const pad = opts.pad || { l: 44, r: 12, t: 10, b: 26 };
+  const pw = Math.max(1, Math.floor(w - pad.l - pad.r));
+  const ph = Math.max(1, Math.floor(h - pad.t - pad.b));
+  const specDuration = Number.isFinite(spec.duration) && spec.duration > 0 ? spec.duration :
+    (spec.times && spec.times.length && spec.hop && spec.sr ?
+      spec.times[spec.times.length - 1] + spec.hop / spec.sr / 2 : 0);
+  const duration = Number.isFinite(opts.duration) && opts.duration > 0 ? opts.duration : specDuration;
+  if (!rows || !(duration > 0)) {
+    drawTimeAxis(ctx, pad, pw, ph, 0);
+    return;
+  }
 
-  const img = ctx.createImageData(w, h);
   const cols = data[0].length;
-  // dB normalisation: assume floor -100, ceiling 0.
+  const edges = spec.time_edges || [];
   const dbMin = opts.dbMin ?? -100, dbMax = opts.dbMax ?? 0;
-  for (let y = 0; y < h; y++) {
-    const rowIdx = Math.floor((h - 1 - y) / h * rows);
-    const row = data[rowIdx];
-    for (let x = 0; x < w; x++) {
-      const colIdx = Math.floor(x / w * cols);
-      const v = row[colIdx];
-      const t = (v - dbMin) / (dbMax - dbMin);
-      const [r, g, b] = colormap(t);
-      const idx = (y * w + x) * 4;
+
+  const img = ctx.createImageData(pw, ph);
+  const timeForColumn = (x) => duration > 0 ? duration * x / pw : 0;
+  const timeRow = (t) => {
+    if (edges.length === rows + 1) {
+      if (t <= edges[0]) return 0;
+      if (t >= edges[rows]) return rows - 1;
+      let lo = 0, hi = rows - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (t < edges[mid + 1]) hi = mid; else lo = mid + 1;
+      }
+      return lo;
+    }
+    return Math.min(rows - 1, Math.floor(t / (duration || 1) * rows));
+  };
+
+  const frameRows = Array.from({ length: pw }, (_, x) => timeRow(timeForColumn(x)));
+
+  for (let y = 0; y < ph; y++) {
+    for (let x = 0; x < pw; x++) {
+      const freqIdx = Math.floor((ph - 1 - y) / ph * cols);
+      const v = data[frameRows[x]][freqIdx];
+      const t01 = (v - dbMin) / (dbMax - dbMin);
+      const [r, g, b] = colormap(t01);
+      const idx = (y * pw + x) * 4;
       img.data[idx] = r; img.data[idx + 1] = g; img.data[idx + 2] = b; img.data[idx + 3] = 255;
     }
   }
-  ctx.putImageData(img, 0, 0);
+
+  // Put through a temporary canvas so device-pixel-ratio scaling is applied.
+  const off = document.createElement("canvas");
+  off.width = pw; off.height = ph;
+  off.getContext("2d").putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, pad.l, pad.t, pw, ph);
+  drawTimeAxis(ctx, pad, pw, ph, duration || 0);
 }
 
 /* -------------------------------------------------------------- line plot */
 
+function timeTickPositions(duration) {
+  if (!(duration > 0)) return [0];
+  const rawStep = duration / 4;
+  const power = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const steps = [1, 2, 2.5, 5, 10].map(v => v * power);
+  const step = steps.find(v => v >= rawStep) || steps[steps.length - 1];
+  const ticks = [0];
+  for (let k = 1; k * step < duration - 1e-9; k++) ticks.push(k * step);
+  ticks.push(duration);
+  return ticks;
+}
+
+function drawTimeAxis(ctx, pad, pw, ph, duration) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(139,148,158,0.25)";
+  ctx.fillStyle = "rgba(139,148,158,0.7)";
+  ctx.font = "10px sans-serif";
+  ctx.textAlign = "center";
+  const y = pad.t + ph;
+  ctx.beginPath();
+  ctx.moveTo(pad.l, y);
+  ctx.lineTo(pad.l + pw, y);
+  ctx.stroke();
+  for (const t of timeTickPositions(duration)) {
+    const x = pad.l + (duration > 0 ? t / duration * pw : 0);
+    ctx.fillText(fmtTime(t), Math.max(pad.l + 18, Math.min(pad.l + pw - 18, x)), y + 14);
+  }
+  ctx.restore();
+}
+
 function drawLinePlot(canvas, seriesList, opts = {}) {
   const { ctx, w, h } = setupCanvas(canvas);
   ctx.clearRect(0, 0, w, h);
-  const pad = { l: 44, r: 12, t: 10, b: 20 };
+  const pad = opts.pad || { l: 44, r: 12, t: 10, b: 26 };
   const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
 
-  let yMin = Infinity, yMax = -Infinity, xMax = 0;
+  let yMin = Infinity, yMax = -Infinity;
+  let indexMax = 0;
+  let duration = Number.isFinite(opts.duration) ? opts.duration : null;
   for (const s of seriesList) {
-    for (let i = 0; i < s.data.length; i++) {
-      const v = s.data[i];
+    indexMax = Math.max(indexMax, s.data.length);
+    if (s.times && s.times.length) {
+      if (!(duration > 0)) duration = s.times[s.times.length - 1];
+    }
+    for (const v of s.data) {
       if (v < yMin) yMin = v;
       if (v > yMax) yMax = v;
-      xMax = Math.max(xMax, s.data.length);
     }
   }
   if (!isFinite(yMin)) return;
   if (yMin === yMax) { yMin -= 1; yMax += 1; }
   const range = yMax - yMin;
+  if (!(duration > 0)) duration = opts.fallbackDuration || 0;
 
   // grid
   ctx.strokeStyle = "rgba(139,148,158,0.15)";
   ctx.fillStyle = "rgba(139,148,158,0.6)";
   ctx.font = "10px sans-serif";
+  ctx.textAlign = "right";
   for (let g = 0; g <= 4; g++) {
     const y = pad.t + ph * (g / 4);
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + pw, y); ctx.stroke();
     const val = yMax - range * (g / 4);
-    ctx.fillText(fmtVal(val), 4, y + 3);
+    ctx.fillText(fmtVal(val), pad.l - 4, y + 3);
   }
 
-  const xAt = (i) => pad.l + (xMax <= 1 ? 0 : i / (xMax - 1) * pw);
+  if (duration > 0) {
+    for (const t of timeTickPositions(duration)) {
+      const x = pad.l + t / duration * pw;
+      ctx.beginPath();
+      ctx.moveTo(x, pad.t);
+      ctx.lineTo(x, pad.t + ph);
+      ctx.stroke();
+    }
+  }
+
+  const xAtIndex = (i) => {
+    if (duration > 0) return pad.l;
+    return pad.l + (indexMax <= 1 ? 0 : i / (indexMax - 1) * pw);
+  };
+  const xAtTime = (t) => pad.l + (duration > 0 ? t / duration * pw : 0);
   const yAt = (v) => pad.t + (1 - (v - yMin) / range) * ph;
 
   for (const s of seriesList) {
@@ -194,11 +277,15 @@ function drawLinePlot(canvas, seriesList, opts = {}) {
     ctx.lineWidth = s.width || 1.4;
     ctx.beginPath();
     for (let i = 0; i < s.data.length; i++) {
-      const x = xAt(i), y = yAt(s.data[i]);
+      const t = s.times && s.times[i] != null ? s.times[i] : null;
+      const x = t != null && duration > 0 ? xAtTime(t) : xAtIndex(i);
+      const y = yAt(s.data[i]);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
   }
+
+  if (duration > 0) drawTimeAxis(ctx, pad, pw, ph, duration);
 }
 
 function fmtVal(v) {
